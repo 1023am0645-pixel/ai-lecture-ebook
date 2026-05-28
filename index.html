@@ -98,6 +98,21 @@ body {
   transition: background .15s, border-color .15s;
 }
 .icon-btn:hover { background: var(--hilite-bg); border-color: var(--muted); }
+.icon-btn:disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+.voice-btn {
+  min-width: 52px;
+  padding: 0 10px;
+  font-size: .82rem;
+  font-weight: 700;
+}
+.voice-btn.is-reading {
+  color: #0c0c0f;
+  background: var(--accent);
+  border-color: var(--accent);
+}
 .brand {
   font-size: .9rem;
   font-weight: 600;
@@ -1031,6 +1046,11 @@ td.num {
   .progress-track, .page-count { display: none; }
   .tools { gap: 6px; }
   .icon-btn { min-width: 36px; height: 36px; font-size: .92rem; }
+  .voice-btn {
+    min-width: 46px;
+    padding: 0 8px;
+    font-size: .76rem;
+  }
   .stage {
     height: calc(100vh - 56px);
     padding: 12px 12px 86px;
@@ -1167,6 +1187,7 @@ td.num {
   <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
   <div class="page-count" id="pageCount">01 / 01</div>
   <div class="tools">
+    <button class="icon-btn voice-btn" id="voiceBtn" aria-label="현재 페이지 음성으로 듣기" title="현재 페이지 읽기">듣기</button>
     <button class="icon-btn" id="fontDown" aria-label="글자 작게">A−</button>
     <button class="icon-btn" id="fontUp" aria-label="글자 크게">A+</button>
     <button class="icon-btn" id="themeBtn" aria-label="테마 전환">☀</button>
@@ -1256,9 +1277,130 @@ function render() {
     updateScrollThumb();
   });
 }
-function next() { index += isMobile() ? 1 : 2; render(); }
-function prev() { index -= isMobile() ? 1 : 2; render(); }
-function goToPage(n) { index = n; sidebar.classList.remove('open'); render(); }
+const voiceBtn = document.getElementById('voiceBtn');
+const speechSupported = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
+let preferredVoice = null;
+let ttsChunks = [];
+let ttsCursor = 0;
+let ttsActive = false;
+let ttsStopping = false;
+
+function loadPreferredVoice() {
+  if (!speechSupported) return null;
+  const voices = speechSynthesis.getVoices();
+  const koVoices = voices.filter(voice =>
+    /^ko[-_]?KR$/i.test(voice.lang || '') ||
+    /korean|한국|대한민국|ko[-_]?kr/i.test(`${voice.name} ${voice.lang}`)
+  );
+  const maleHints = /(male|man|남성|yoon|yong|young|minho|jinho|seojun|injoon|민준|준서|지훈|현우|영호)/i;
+  preferredVoice = koVoices.find(voice => maleHints.test(voice.name)) || koVoices[0] || voices.find(voice => /^ko/i.test(voice.lang || '')) || null;
+  return preferredVoice;
+}
+
+function updateVoiceButton() {
+  if (!voiceBtn) return;
+  voiceBtn.textContent = ttsActive ? '중지' : '듣기';
+  voiceBtn.classList.toggle('is-reading', ttsActive);
+  voiceBtn.setAttribute('aria-label', ttsActive ? '음성 읽기 중지' : '현재 페이지 음성으로 듣기');
+}
+
+function getReadableTextFromCurrentPage() {
+  const visiblePages = [...book.querySelectorAll(isMobile() ? '.page.mobile-active' : '.page')]
+    .filter(page => !['blank', 'image-cover'].includes(page.dataset.kind));
+  const text = visiblePages.map(page => {
+    const clone = page.cloneNode(true);
+    clone.querySelectorAll('button, .page-number, .scroll-indicator').forEach(el => el.remove());
+    return clone.textContent || '';
+  }).join(' ');
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/[‹›]/g, '')
+    .trim();
+}
+
+function makeSpeechChunks(text) {
+  const chunks = [];
+  let current = '';
+  text.split(/\s+/).forEach(word => {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length > 150 && current) {
+      chunks.push(current);
+      current = word;
+    } else {
+      current = next;
+    }
+  });
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function finishReading() {
+  ttsActive = false;
+  ttsStopping = false;
+  ttsChunks = [];
+  ttsCursor = 0;
+  updateVoiceButton();
+}
+
+function speakNextChunk() {
+  if (!speechSupported || !ttsActive || ttsStopping) return;
+  if (ttsCursor >= ttsChunks.length) {
+    finishReading();
+    return;
+  }
+  const utterance = new SpeechSynthesisUtterance(ttsChunks[ttsCursor]);
+  ttsCursor += 1;
+  utterance.lang = 'ko-KR';
+  utterance.rate = 0.82;
+  utterance.pitch = 0.78;
+  utterance.volume = 1;
+  utterance.voice = preferredVoice || loadPreferredVoice();
+  utterance.onend = () => {
+    if (!ttsStopping) speakNextChunk();
+  };
+  utterance.onerror = () => {
+    if (!ttsStopping) finishReading();
+  };
+  speechSynthesis.speak(utterance);
+}
+
+function startReading() {
+  if (!speechSupported) {
+    alert('이 브라우저에서는 음성 읽기를 지원하지 않습니다. Safari 또는 Chrome 최신 버전에서 열어주세요.');
+    return;
+  }
+  const text = getReadableTextFromCurrentPage();
+  if (!text) {
+    alert('현재 페이지에는 읽을 텍스트가 없습니다. 다음 페이지로 넘긴 뒤 다시 눌러주세요.');
+    return;
+  }
+  loadPreferredVoice();
+  ttsChunks = makeSpeechChunks(text);
+  ttsCursor = 0;
+  ttsActive = true;
+  ttsStopping = false;
+  updateVoiceButton();
+  speechSynthesis.cancel();
+  setTimeout(speakNextChunk, 80);
+}
+
+function stopReading() {
+  if (!speechSupported) return;
+  if (ttsActive || speechSynthesis.speaking || speechSynthesis.pending) {
+    ttsStopping = true;
+    speechSynthesis.cancel();
+  }
+  finishReading();
+}
+
+function toggleReading() {
+  if (ttsActive) stopReading();
+  else startReading();
+}
+
+function next() { stopReading(); index += isMobile() ? 1 : 2; render(); }
+function prev() { stopReading(); index -= isMobile() ? 1 : 2; render(); }
+function goToPage(n) { stopReading(); index = n; sidebar.classList.remove('open'); render(); }
 function goToChapter(id) { goToPage(chapterPageMap[id] || 0); }
 
 document.getElementById('nextBtn').addEventListener('click', next);
@@ -1269,6 +1411,18 @@ document.addEventListener('keydown', e => {
   if (e.key.toLowerCase() === 't') sidebar.classList.toggle('open');
 });
 document.getElementById('menuBtn').addEventListener('click', () => sidebar.classList.toggle('open'));
+if (voiceBtn) {
+  if (speechSupported) {
+    loadPreferredVoice();
+    speechSynthesis.onvoiceschanged = loadPreferredVoice;
+    voiceBtn.addEventListener('click', toggleReading);
+    addEventListener('beforeunload', () => speechSynthesis.cancel());
+  } else {
+    voiceBtn.disabled = true;
+    voiceBtn.title = '이 브라우저에서는 음성 읽기를 지원하지 않습니다.';
+  }
+  updateVoiceButton();
+}
 document.getElementById('fontUp').addEventListener('click', () => {
   fontScale = Math.min(1.24, fontScale + .06);
   document.documentElement.style.setProperty('--scale', fontScale.toFixed(2));
@@ -1322,7 +1476,10 @@ const sideLinks = document.getElementById('sideLinks');
 sideLinks.innerHTML = pages.filter(p => p.chapterStart)
   .map(p => `<button class="side-link" data-goto="${p.chapterId}">${p.title.replace(/^\d+\.\s*/, '')}</button>`).join('');
 sideLinks.querySelectorAll('[data-goto]').forEach(btn => btn.addEventListener('click', () => goToChapter(btn.dataset.goto)));
-addEventListener('resize', render);
+addEventListener('resize', () => {
+  stopReading();
+  render();
+});
 render();
 </script>
 <!-- Cloudflare Web Analytics --><script defer src='https://static.cloudflareinsights.com/beacon.min.js' data-cf-beacon='{"token": "e1f869da311e4775b75df520cf20bc63"}'></script><!-- End Cloudflare Web Analytics -->
