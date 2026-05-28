@@ -1280,7 +1280,7 @@ function render() {
 const voiceBtn = document.getElementById('voiceBtn');
 const speechSupported = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
 let preferredVoice = null;
-let ttsChunks = [];
+let ttsQueue = [];
 let ttsCursor = 0;
 let ttsActive = false;
 let ttsStopping = false;
@@ -1293,7 +1293,13 @@ function loadPreferredVoice() {
     /korean|한국|대한민국|ko[-_]?kr/i.test(`${voice.name} ${voice.lang}`)
   );
   const maleHints = /(male|man|남성|yoon|yong|young|minho|jinho|seojun|injoon|민준|준서|지훈|현우|영호)/i;
-  preferredVoice = koVoices.find(voice => maleHints.test(voice.name)) || koVoices[0] || voices.find(voice => /^ko/i.test(voice.lang || '')) || null;
+  const femaleHints = /(female|woman|여성|yuna|sora|kyuri|유나|소라|규리)/i;
+  preferredVoice =
+    koVoices.find(voice => maleHints.test(voice.name)) ||
+    koVoices.find(voice => !femaleHints.test(voice.name)) ||
+    koVoices[0] ||
+    voices.find(voice => /^ko/i.test(voice.lang || '')) ||
+    null;
   return preferredVoice;
 }
 
@@ -1304,28 +1310,41 @@ function updateVoiceButton() {
   voiceBtn.setAttribute('aria-label', ttsActive ? '음성 읽기 중지' : '현재 페이지 음성으로 듣기');
 }
 
-function getReadableTextFromCurrentPage() {
-  const visiblePages = [...book.querySelectorAll(isMobile() ? '.page.mobile-active' : '.page')]
-    .filter(page => !['blank', 'image-cover'].includes(page.dataset.kind));
-  const text = visiblePages.map(page => {
-    const clone = page.cloneNode(true);
-    clone.querySelectorAll('button, .page-number, .scroll-indicator').forEach(el => el.remove());
-    return clone.textContent || '';
-  }).join(' ');
-  return text
-    .replace(/\s+/g, ' ')
+function normalizeSpeechText(text) {
+  return (text || '')
+    .replace(/TABLE OF CONTENTS/gi, '목차')
+    .replace(/END OF BOOK/gi, '마지막 장')
+    .replace(/APPENDIX\s*·\s*후기\s*원문/gi, '부록. 후기 원문')
+    .replace(/CHAPTER\s*0?(\d+)\s*[-—–]\s*\d+/gi, (_, n) => `챕터 ${Number(n)}`)
+    .replace(/CH\.\s*0?(\d+)\s*·\s*이어서/gi, (_, n) => `챕터 ${Number(n)} 이어서`)
+    .replace(/P\s*·\s*(\d+)/gi, (_, n) => `후기 ${Number(n)}`)
+    .replace(/\bAI\b/g, '에이아이')
+    .replace(/\bGPT\b/g, '지피티')
+    .replace(/\bGemini\b/g, '제미나이')
+    .replace(/\bGoogle Flow\b/g, '구글 플로우')
+    .replace(/\bCanva\b/g, '캔바')
+    .replace(/\bHTML\b/g, '에이치티엠엘')
+    .replace(/\bPC\b/g, '피씨')
+    .replace(/\s*·\s*/g, '. ')
+    .replace(/[—–]/g, '. ')
     .replace(/[‹›]/g, '')
+    .replace(/\s+/g, ' ')
     .trim();
 }
 
-function makeSpeechChunks(text) {
+function splitSpeechText(text, maxLength = 145) {
+  const normalized = normalizeSpeechText(text);
+  if (!normalized) return [];
+  const sentences = normalized.match(/[^.!?。！？]+[.!?。！？]?/g) || [normalized];
   const chunks = [];
   let current = '';
-  text.split(/\s+/).forEach(word => {
-    const next = current ? `${current} ${word}` : word;
-    if (next.length > 150 && current) {
+  sentences.forEach(sentence => {
+    const clean = sentence.trim();
+    if (!clean) return;
+    const next = current ? `${current} ${clean}` : clean;
+    if (next.length > maxLength && current) {
       chunks.push(current);
-      current = word;
+      current = clean;
     } else {
       current = next;
     }
@@ -1334,29 +1353,111 @@ function makeSpeechChunks(text) {
   return chunks;
 }
 
+function addSpeechItem(queue, text, type = 'body') {
+  const limits = { heading: 90, marker: 70, toc: 115, quote: 130, body: 145 };
+  splitSpeechText(text, limits[type] || 145).forEach(chunk => {
+    queue.push({ text: chunk, type });
+  });
+}
+
+function describeTocRow(row) {
+  const num = normalizeSpeechText(row.querySelector('.toc-num')?.textContent || '');
+  const main = normalizeSpeechText(row.querySelector('.toc-main')?.textContent || '');
+  const sub = normalizeSpeechText(row.querySelector('.toc-subline')?.textContent || '');
+  const page = normalizeSpeechText(row.querySelector('.toc-page-num')?.textContent || '');
+  const numValue = Number(num);
+  const pageValue = Number(page);
+  return [
+    Number.isFinite(numValue) && `목차 ${numValue}번`,
+    main,
+    sub,
+    Number.isFinite(pageValue) && `${pageValue}페이지`
+  ]
+    .filter(Boolean)
+    .join('. ');
+}
+
+function speechTypeFor(el) {
+  if (el.matches('.ch-marker, .toc-kicker, .prologue-meta-sub, .review-num, .person-label')) return 'marker';
+  if (el.matches('h1, h2, h3, h4, .ch-title, .ch-sub, .toc-heading, .cover-title-main, .cover-title-subtitle, .prologue-title, .person-name, .item-head')) return 'heading';
+  if (el.matches('.toc-row')) return 'toc';
+  if (el.matches('blockquote, .quote, cite')) return 'quote';
+  return 'body';
+}
+
+function describeReadableElement(el) {
+  if (el.matches('.toc-row')) return describeTocRow(el);
+  if (el.matches('li')) {
+    const parent = el.parentElement;
+    const pos = parent && /^(OL|UL)$/.test(parent.tagName)
+      ? [...parent.children].filter(child => child.tagName === 'LI').indexOf(el) + 1
+      : 0;
+    const prefix = pos ? `${pos}번. ` : '';
+    return prefix + (el.textContent || '');
+  }
+  return el.textContent || '';
+}
+
+function collectSpeechItemsFromPage(page, queue) {
+  const ignored = 'button, .page-number, .scroll-indicator, .scroll-thumb, .blank-mark, script, style';
+  const readable = '.toc-row, .cover-kicker, .cover-title-main, .cover-title-subtitle, .cover-sub, .cover-author, .prologue-title, .prologue-meta-main, .prologue-meta-sub, .prologue-meta-date, .ch-marker, .ch-title, .ch-sub, .toc-kicker, .toc-heading, h1, h2, h3, h4, .person-label, .person-name, .lede, .close-stmt, blockquote, cite, p, li, .item-head, .review-num, .review-text, dt, dd';
+  function walk(node) {
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+    const el = node;
+    if (el.matches(ignored)) return;
+    if (el.matches(readable)) {
+      addSpeechItem(queue, describeReadableElement(el), speechTypeFor(el));
+      return;
+    }
+    [...el.children].forEach(walk);
+  }
+  walk(page);
+}
+
+function getSpeechQueueFromCurrentPage() {
+  const visiblePages = [...book.querySelectorAll(isMobile() ? '.page.mobile-active' : '.page')]
+    .filter(page => !['blank', 'image-cover'].includes(page.dataset.kind));
+  const queue = [];
+  visiblePages.forEach(page => collectSpeechItemsFromPage(page, queue));
+  return queue.filter(item => item.text);
+}
+
 function finishReading() {
   ttsActive = false;
   ttsStopping = false;
-  ttsChunks = [];
+  ttsQueue = [];
   ttsCursor = 0;
   updateVoiceButton();
 }
 
-function speakNextChunk() {
+function speechProfile(type) {
+  const profiles = {
+    marker: { rate: 0.72, pitch: 0.68, pause: 520 },
+    heading: { rate: 0.74, pitch: 0.70, pause: 620 },
+    toc: { rate: 0.78, pitch: 0.74, pause: 420 },
+    quote: { rate: 0.76, pitch: 0.76, pause: 430 },
+    body: { rate: 0.82, pitch: 0.76, pause: 240 }
+  };
+  return profiles[type] || profiles.body;
+}
+
+function speakNextItem() {
   if (!speechSupported || !ttsActive || ttsStopping) return;
-  if (ttsCursor >= ttsChunks.length) {
+  if (ttsCursor >= ttsQueue.length) {
     finishReading();
     return;
   }
-  const utterance = new SpeechSynthesisUtterance(ttsChunks[ttsCursor]);
+  const item = ttsQueue[ttsCursor];
   ttsCursor += 1;
+  const profile = speechProfile(item.type);
+  const utterance = new SpeechSynthesisUtterance(item.text);
   utterance.lang = 'ko-KR';
-  utterance.rate = 0.82;
-  utterance.pitch = 0.78;
+  utterance.rate = profile.rate;
+  utterance.pitch = profile.pitch;
   utterance.volume = 1;
   utterance.voice = preferredVoice || loadPreferredVoice();
   utterance.onend = () => {
-    if (!ttsStopping) speakNextChunk();
+    if (!ttsStopping) setTimeout(speakNextItem, profile.pause);
   };
   utterance.onerror = () => {
     if (!ttsStopping) finishReading();
@@ -1369,19 +1470,19 @@ function startReading() {
     alert('이 브라우저에서는 음성 읽기를 지원하지 않습니다. Safari 또는 Chrome 최신 버전에서 열어주세요.');
     return;
   }
-  const text = getReadableTextFromCurrentPage();
-  if (!text) {
+  const queue = getSpeechQueueFromCurrentPage();
+  if (!queue.length) {
     alert('현재 페이지에는 읽을 텍스트가 없습니다. 다음 페이지로 넘긴 뒤 다시 눌러주세요.');
     return;
   }
   loadPreferredVoice();
-  ttsChunks = makeSpeechChunks(text);
+  ttsQueue = queue;
   ttsCursor = 0;
   ttsActive = true;
   ttsStopping = false;
   updateVoiceButton();
   speechSynthesis.cancel();
-  setTimeout(speakNextChunk, 80);
+  setTimeout(speakNextItem, 120);
 }
 
 function stopReading() {
